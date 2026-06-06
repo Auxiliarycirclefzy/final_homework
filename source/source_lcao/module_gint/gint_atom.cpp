@@ -121,6 +121,14 @@ void GintAtom::set_phi_dphi(
     const std::vector<Vec3d>& coords, const int stride,
     T* phi, T* dphi_x, T* dphi_y, T* dphi_z) const
 {
+    if (phi != nullptr) {
+        phi = (T*)__builtin_assume_aligned(phi, 64);
+    }
+    if (dphi_x != nullptr) {
+        dphi_x = (T*)__builtin_assume_aligned(dphi_x, 64);
+        dphi_y = (T*)__builtin_assume_aligned(dphi_y, 64);
+        dphi_z = (T*)__builtin_assume_aligned(dphi_z, 64);
+    }
     const int num_mgrids = coords.size();
     
     // orb_ does not have the member variable dr_uniform
@@ -188,7 +196,18 @@ void GintAtom::set_phi_dphi(
                 const int ll = atom_->iw2l[iw];
                 const int idx_lm = atom_->iw2_ylm[iw];
 
-                const double rl = pow_int(dist, ll);
+                // --- 【修改代码：多项式显式展开消除分支】 ---
+                double rl = 1.0;
+                switch (ll) {
+                    case 4: rl = dist * dist * dist * dist; break;
+                    case 3: rl = dist * dist * dist; break;
+                    case 2: rl = dist * dist; break;
+                    case 1: rl = dist; break;
+                    case 0: rl = 1.0; break;
+                    default: rl = pow_int(dist, ll); // 处理罕见高阶
+                }
+                // --------------------------------------------
+                
                 const double tmprl = tmp / rl;
 
                 // 3D wave functions
@@ -198,11 +217,30 @@ void GintAtom::set_phi_dphi(
                 }
                 
                 // derivative of wave functions with respect to atom positions.
-                const double tmpdphi_rly = (dtmp - tmp * ll / dist) / rl * rly[idx_lm] / dist;
+               const double tmpdphi_rly = (dtmp - tmp * ll / dist) / rl / dist; 
+                // 注意：这里把 rly[idx_lm] 移到循环里面去乘，保持外层干净
 
-                dphi_x[im * stride + iw] =  tmpdphi_rly * coord.x + tmprl * grly[idx_lm*3];
-                dphi_y[im * stride + iw] =  tmpdphi_rly * coord.y + tmprl * grly[idx_lm*3 + 1];
-                dphi_z[im * stride + iw] =  tmpdphi_rly * coord.z + tmprl * grly[idx_lm*3 + 2];
+                // --- 【新增代码：OpenMP SIMD 强制向量化与循环展开】 ---
+                #pragma omp simd aligned(phi, dphi_x, dphi_y, dphi_z: 64) simdlen(8)
+                #pragma unroll(4)
+                for(int im = 0; im < mgrids_num; ++im)
+                {
+                    // 3D wave functions
+                    if(phi != nullptr)
+                    {
+                        phi[im * stride + iw] = tmprl * rly[idx_lm];
+                    }
+                    
+                    // derivative of wave functions with respect to atom positions.
+                    if(dphi_x != nullptr)
+                    {
+                        double tmpdphi_rly_val = tmpdphi_rly * rly[idx_lm];
+                        dphi_x[im * stride + iw] =  tmpdphi_rly_val * coord.x + tmprl * grly[idx_lm][0];
+                        dphi_y[im * stride + iw] =  tmpdphi_rly_val * coord.y + tmprl * grly[idx_lm][1];
+                        dphi_z[im * stride + iw] =  tmpdphi_rly_val * coord.z + tmprl * grly[idx_lm][2];
+                    }
+                }
+                // --------------------------------------------------------
             }
         }
     }
