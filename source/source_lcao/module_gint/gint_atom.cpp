@@ -35,7 +35,6 @@ GintAtom::GintAtom(
             RadialBlock block;
             block.begin_iw = iw;
             block.size = 2 * l + 1;
-            // The first orbital in each radial block always starts from m = 0.
             block.ylm_begin = atom_->iw2_ylm[iw];
             block.psi_uniform = p_psi_uniform_[iw];
             block.dpsi_uniform = p_dpsi_uniform_[iw];
@@ -48,12 +47,8 @@ template <typename T>
 void GintAtom::set_phi(const std::vector<Vec3d>& coords, const int stride, T* phi) const
 {
     const int num_mgrids = coords.size();
-
-    // orb_ does not have the member variable dr_uniform
     const double dr_uniform = orb_->PhiLN(0, 0).dr_uniform;
 
-    // store the spherical harmonics
-    // it's outside the loop to reduce the vector allocation overhead
     std::vector<double> ylma;
     const auto* blocks = radial_blocks_.data();
     const int num_blocks = radial_blocks_.size();
@@ -61,26 +56,15 @@ void GintAtom::set_phi(const std::vector<Vec3d>& coords, const int stride, T* ph
     for(int im = 0; im < num_mgrids; im++)
     {
         const Vec3d& coord = coords[im];
-        // 1e-9 is to avoid division by zero
         const double dist = coord.norm() < 1e-9 ? 1e-9 : coord.norm();
         if(dist > orb_->getRcut())
         {   
-            // if the distance is larger than the cutoff radius,
-            // the wave function values are all zeros
             ModuleBase::GlobalFunc::ZEROS(phi + im * stride, atom_->nw);
         }
         else
         {
-            // spherical harmonics
-            // TODO: vectorize the sph_harm function, 
-            // the vectorized function can be called once for all meshgrids in a biggrid
             ModuleBase::Ylm::sph_harm(atom_->nwl, coord.x/dist, coord.y/dist, coord.z/dist, ylma);
-            // interpolation
 
-            // these parameters are related to interpolation
-            // because once the distance from atom to grid point is known,
-            // we can obtain the parameters for interpolation and
-            // store them first! these operations can save lots of efforts.
             const double position = dist / dr_uniform;
             const int ip = static_cast<int>(position);
             const double dx = position - ip;
@@ -103,9 +87,6 @@ void GintAtom::set_phi(const std::vector<Vec3d>& coords, const int stride, T* ph
 
                 const int begin_iw = block.begin_iw;
                 const int end_iw = begin_iw + block.size;
-                // Within one (L, N) block, m runs consecutively, so we can walk
-                // the Ylm buffer linearly instead of reading atom_->iw2_ylm[iw]
-                // for every orbital in the hot loop.
                 int idx_lm = block.ylm_begin;
                 for (int iw = begin_iw; iw < end_iw; ++iw, ++idx_lm)
                 {
@@ -130,24 +111,27 @@ void GintAtom::set_phi_dphi(
         dphi_z = (T*)__builtin_assume_aligned(dphi_z, 64);
     }
     const int num_mgrids = coords.size();
-    
-    // orb_ does not have the member variable dr_uniform
     const double dr_uniform = orb_->PhiLN(0, 0).dr_uniform;
     
     const int nylm = std::pow(atom_->nwl + 1, 2);
     std::vector<double> rly(nylm);
-    std::vector<double> grly(nylm * 3);
+    
+    // 展平为一维连续内存
+    std::vector<double> grly_data(nylm * 3);
+    
+    // 构造代理二维指针数组以适配底层接口
+    std::vector<double*> grly_ptrs(nylm);
+    for(int i = 0; i < nylm; ++i) {
+        grly_ptrs[i] = &grly_data[i * 3];
+    }
     
     for(int im = 0; im < num_mgrids; im++)
     {
         const Vec3d& coord = coords[im];
-        // 1e-9 is to avoid division by zero
         const double dist = coord.norm() < 1e-9 ? 1e-9 : coord.norm();
 
         if(dist > orb_->getRcut())
         {
-            // if the distance is larger than the cutoff radius,
-            // the wave function values are all zeros
             if(phi != nullptr)
             {
                 ModuleBase::GlobalFunc::ZEROS(phi + im * stride, atom_->nw);
@@ -158,12 +142,9 @@ void GintAtom::set_phi_dphi(
         }
         else
         {
-            // spherical harmonics
-            // TODO: vectorize the sph_harm function, 
-            // the vectorized function can be called once for all meshgrids in a biggrid
-            ModuleBase::Ylm::grad_rl_sph_harm(atom_->nwl, coord.x, coord.y, coord.z, rly.data(), grly.data());
+            // 使用代理指针数组传入，底层函数会将结果写入 grly_data 中
+            ModuleBase::Ylm::grad_rl_sph_harm(atom_->nwl, coord.x, coord.y, coord.z, rly.data(), grly_ptrs.data());
 
-            // interpolation
             const double position = dist / dr_uniform;
             const int ip = static_cast<int>(position);
             const double x0 = position - ip;
@@ -174,29 +155,25 @@ void GintAtom::set_phi_dphi(
             const double x03 = x0 * x3 / 2;
 
             double tmp, dtmp;
+            
+            // 对每个轨道 iw 进行计算
             for(int iw = 0; iw < atom_->nw; ++iw)
             {
-                // this is a new 'l', we need 1D orbital wave
-                // function from interpolation method.
                 if(atom_->iw2_new[iw])
                 {
                     auto psi_uniform = p_psi_uniform_[iw];
                     auto dpsi_uniform = p_dpsi_uniform_[iw];
-                    // use Polynomia Interpolation method to get the
-                    // wave functions
 
                     tmp = x12 * (psi_uniform[ip] * x3 + psi_uniform[ip + 3] * x0)
                         + x03 * (psi_uniform[ip + 1] * x2 - psi_uniform[ip + 2] * x1);
 
                     dtmp = x12 * (dpsi_uniform[ip] * x3 + dpsi_uniform[ip + 3] * x0)
                         + x03 * (dpsi_uniform[ip + 1] * x2 - dpsi_uniform[ip + 2] * x1);
-                } // new l is used.
+                } 
 
-                // get the 'l' of this localized wave function
                 const int ll = atom_->iw2l[iw];
                 const int idx_lm = atom_->iw2_ylm[iw];
 
-                // --- 【修改代码：多项式显式展开消除分支】 ---
                 double rl = 1.0;
                 switch (ll) {
                     case 4: rl = dist * dist * dist * dist; break;
@@ -204,43 +181,27 @@ void GintAtom::set_phi_dphi(
                     case 2: rl = dist * dist; break;
                     case 1: rl = dist; break;
                     case 0: rl = 1.0; break;
-                    default: rl = pow_int(dist, ll); // 处理罕见高阶
+                    default: rl = pow_int(dist, ll); 
                 }
-                // --------------------------------------------
                 
                 const double tmprl = tmp / rl;
+                const double tmpdphi_rly = (dtmp - tmp * ll / dist) / rl / dist; 
 
-                // 3D wave functions
+                // 移除错误的内部 im 循环，直接对当前网格点(im)和当前轨道(iw)赋值
                 if(phi != nullptr)
                 {
                     phi[im * stride + iw] = tmprl * rly[idx_lm];
                 }
                 
-                // derivative of wave functions with respect to atom positions.
-               const double tmpdphi_rly = (dtmp - tmp * ll / dist) / rl / dist; 
-                // 注意：这里把 rly[idx_lm] 移到循环里面去乘，保持外层干净
-
-                // --- 【新增代码：OpenMP SIMD 强制向量化与循环展开】 ---
-                #pragma omp simd aligned(phi, dphi_x, dphi_y, dphi_z: 64) simdlen(8)
-                #pragma unroll(4)
-                for(int im = 0; im < mgrids_num; ++im)
+                if(dphi_x != nullptr)
                 {
-                    // 3D wave functions
-                    if(phi != nullptr)
-                    {
-                        phi[im * stride + iw] = tmprl * rly[idx_lm];
-                    }
+                    double tmpdphi_rly_val = tmpdphi_rly * rly[idx_lm];
                     
-                    // derivative of wave functions with respect to atom positions.
-                    if(dphi_x != nullptr)
-                    {
-                        double tmpdphi_rly_val = tmpdphi_rly * rly[idx_lm];
-                        dphi_x[im * stride + iw] =  tmpdphi_rly_val * coord.x + tmprl * grly[idx_lm][0];
-                        dphi_y[im * stride + iw] =  tmpdphi_rly_val * coord.y + tmprl * grly[idx_lm][1];
-                        dphi_z[im * stride + iw] =  tmpdphi_rly_val * coord.z + tmprl * grly[idx_lm][2];
-                    }
+                    // 使用一维数组偏移寻址
+                    dphi_x[im * stride + iw] = tmpdphi_rly_val * coord.x + tmprl * grly_data[idx_lm * 3 + 0];
+                    dphi_y[im * stride + iw] = tmpdphi_rly_val * coord.y + tmprl * grly_data[idx_lm * 3 + 1];
+                    dphi_z[im * stride + iw] = tmpdphi_rly_val * coord.z + tmprl * grly_data[idx_lm * 3 + 2];
                 }
-                // --------------------------------------------------------
             }
         }
     }
@@ -252,4 +213,5 @@ template void GintAtom::set_phi(const std::vector<Vec3d>& coords, const int stri
 template void GintAtom::set_phi(const std::vector<Vec3d>& coords, const int stride, std::complex<double>* phi) const;
 template void GintAtom::set_phi_dphi(const std::vector<Vec3d>& coords, const int stride, float* phi, float* dphi_x, float* dphi_y, float* dphi_z) const;
 template void GintAtom::set_phi_dphi(const std::vector<Vec3d>& coords, const int stride, double* phi, double* dphi_x, double* dphi_y, double* dphi_z) const;
-}
+
+} // namespace ModuleGint
